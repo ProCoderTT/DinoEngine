@@ -1,60 +1,3 @@
---[[
-    DINO REANIMATE  ·  reanimate engine
-    ─────────────────────────────────────────────────────────────────
-    A full-body limb reanimate ENGINE, in the spirit of Gelatek
-    Reanimate and Krypton: it does the hard part (fake rig, joints,
-    netless, ownership, permadeath, accessories, respawns) and hands your
-    script a rig to animate. No UI, no built-in moves: you build the
-    reanimate on top of it.
-
-    LOAD
-        local Dino = loadstring(readfile("dino_reanimate.lua"))()
-        -- or host it and: loadstring(game:HttpGet("<raw url>"))()
-
-    START
-        local rig = Dino.Start({ RigMode = "Auto" })   -- yields until running
-        -- or set getgenv().DinoReanimateConfig = {...} and Dino.Start()
-
-    ANIMATE (pick any mix)
-        rig:PlayAnimation(12345678, { Loop = true })   -- any Roblox animation id
-        rig:PlayAnimation("dance2")                    -- emotes from the default set
-        rig:SetAnimation("idle", 12345678)             -- animation pack override
-        rig:SetDefaultAnimations(false)                -- turn the movement anims off
-        rig:PlayKeyframes(myKeyframeTable)             -- keyframes written in your script
-        rig:PlayKeyframes("savedName")                 -- JSON from AnimationFolder
-        rig:OnStep(function(dt, rig)                   -- procedural: runs every frame
-            rig.JointsByPart["Right Arm"].Transform = CFrame.Angles(0, 0, math.rad(90))
-        end)
-
-    RESPAWNS
-        It reanimates again by itself after a respawn (AutoRestart). Hook
-        Dino.Started once and your script follows every new rig:
-            Dino.Started:Connect(function(rig) ... end)
-
-    WHAT IT DOES BETTER THAN GELATEK
-      Gelatek                               Dino
-      Constant (0,0,-25.8) velocity on       Velocity = the part's real motion
-        every part, every frame: others        (root velocity + animation), so
-        see drift and snap-back                other players see smooth motion
-      CFrames limbs after physics from last  Drives before physics from live
-        step's fake positions (frame late)     forward kinematics, re-pins after
-      BodyVelocity/BodyAngularVelocity       Per-part anti-gravity force only
-      Sets Player.Character to the fake rig  Keeps your character instance (Zeon
-        (servers can read it as a respawn)     split), so no respawn is triggered
-      Hard-coded R15->R6 offsets             Measured from your own body
-      Hats re-welded by name                 Hats follow their exact limb and
-                                               offset, by instance
-      Joints broken on your screen only      Server-side break + permadeath via
-                                               replicatesignal when available,
-                                               rebuilt joints cut again
-      Void -> dies or spawn                  Back to your last safe spot
-      Old Animate script copy                Animation controller + keyframes +
-                                               per-frame hook for your own anims
-      Loads remote code                      Loads nothing
-
-    Not included on purpose: Gelatek's fling modes (Bullet, TorsoFling).
-]]
-
 local Global = (getgenv and getgenv()) or shared
 
 -- One engine at a time: retire an older copy (and its auto restart)
@@ -83,6 +26,9 @@ local Player = Players.LocalPlayer
 --==================================================
 
 local DEFAULTS = {
+    -- Start
+    AutoStart      = true,      -- reanimate as soon as the file is loaded (Gelatek style)
+
     -- Rig
     RigMode        = "Auto",    -- "Auto" (match your avatar) | "R15ToR6" (R15 avatar, R6 animations)
     Animations     = true,      -- built-in idle/walk/jump/... controller
@@ -1907,8 +1853,19 @@ Dino.Current       = nil
 -- Dino.Start(config) -> rig | nil, err   (yields until running)
 -- config: a table of overrides, or nil for getgenv().DinoReanimateConfig
 -- (or the last config used).
+local starting, lastStartErr = false, nil
+
 function Dino.Start(config)
     if destroyed then return nil, "this engine copy was replaced" end
+    if starting or State.running then
+        -- already running (or starting, e.g. the auto start): hand back that rig
+        local t0 = os.clock()
+        while (starting or State.running) and not Dino.Current and os.clock() - t0 < 60 do
+            task.wait(0.1)
+        end
+        if State.running and Dino.Current then return Dino.Current, nil end
+        return nil, lastStartErr or "start didn't finish"
+    end
     if config ~= nil then
         LastUserConfig = config
     elseif LastUserConfig == nil and type(Global.DinoReanimateConfig) == "table" then
@@ -1916,8 +1873,17 @@ function Dino.Start(config)
     end
     applyConfig(LastUserConfig)
     everStarted, userStopped = true, false
-    local rig, err = start()
-    if not rig then log("start failed: %s", tostring(err)) end
+    starting, lastStartErr = true, nil
+    local ok, rig, err = pcall(start)
+    starting = false
+    if not ok then
+        err, rig = tostring(rig), nil
+        State.running = false
+    end
+    if not rig then
+        lastStartErr = err
+        log("start failed: %s", tostring(err))
+    end
     return rig, err
 end
 
@@ -1955,4 +1921,13 @@ function Dino.Destroy()
 end
 
 Global.DinoReanimate = Dino
+
+-- Gelatek style: loading the file starts the reanimate
+do
+    local user = Global.DinoReanimateConfig
+    if not (type(user) == "table" and user.AutoStart == false) then
+        task.spawn(Dino.Start)
+    end
+end
+
 return Dino
