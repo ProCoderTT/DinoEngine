@@ -1,3 +1,62 @@
+--[[
+    DINO REANIMATE  ·  reanimate engine
+    ─────────────────────────────────────────────────────────────────
+    A full-body limb reanimate ENGINE, in the spirit of Gelatek
+    Reanimate and Krypton: it does the hard part (fake rig, joints,
+    netless, ownership, permadeath, accessories, respawns) and hands your
+    script a rig to animate. No UI, no built-in moves: you build the
+    reanimate on top of it.
+
+    RUN (Gelatek style: reanimates as soon as it loads)
+        local Global = (getgenv and getgenv()) or shared
+        Global.DinoReanimateConfig = { RigMode = "Auto" }   -- any keys from DEFAULTS
+        loadstring(game:HttpGet("<raw url of this file>"))()
+
+    SCRIPTING ON TOP OF IT
+        local Dino = loadstring(game:HttpGet("<raw url>"))()
+        local rig = Dino.Start()      -- the running rig (waits if it's still starting)
+        -- set AutoStart = false in the config to start it yourself with Dino.Start({...})
+
+    ANIMATE (pick any mix)
+        rig:PlayAnimation(12345678, { Loop = true })   -- any Roblox animation id
+        rig:PlayAnimation("dance2")                    -- emotes from the default set
+        rig:SetAnimation("idle", 12345678)             -- animation pack override
+        rig:SetDefaultAnimations(false)                -- turn the movement anims off
+        rig:PlayKeyframes(myKeyframeTable)             -- keyframes written in your script
+        rig:PlayKeyframes("savedName")                 -- JSON from AnimationFolder
+        rig:OnStep(function(dt, rig)                   -- procedural: runs every frame
+            rig.JointsByPart["Right Arm"].Transform = CFrame.Angles(0, 0, math.rad(90))
+        end)
+
+    RESPAWNS
+        It reanimates again by itself after a respawn (AutoRestart). Hook
+        Dino.Started once and your script follows every new rig:
+            Dino.Started:Connect(function(rig) ... end)
+
+    WHAT IT DOES BETTER THAN GELATEK
+      Gelatek                               Dino
+      Constant (0,0,-25.8) velocity on       Velocity = the part's real motion
+        every part, every frame: others        (root velocity + animation), so
+        see drift and snap-back                other players see smooth motion
+      CFrames limbs after physics from last  Drives before physics from live
+        step's fake positions (frame late)     forward kinematics, re-pins after
+      BodyVelocity/BodyAngularVelocity       Per-part anti-gravity force only
+      Sets Player.Character to the fake rig  Keeps your character instance (Zeon
+        (servers can read it as a respawn)     split), so no respawn is triggered
+      Hard-coded R15->R6 offsets             Measured from your own body
+      Hats re-welded by name                 Hats follow their exact limb and
+                                               offset, by instance
+      Joints broken on your screen only      Server-side break + permadeath via
+                                               replicatesignal when available,
+                                               rebuilt joints cut again
+      Void -> dies or spawn                  Back to your last safe spot
+      Old Animate script copy                Animation controller + keyframes +
+                                               per-frame hook for your own anims
+      Loads remote code                      Loads nothing
+
+    Not included on purpose: Gelatek's fling modes (Bullet, TorsoFling).
+]]
+
 local Global = (getgenv and getgenv()) or shared
 
 -- One engine at a time: retire an older copy (and its auto restart)
@@ -1157,8 +1216,70 @@ local userStopped   = false   -- Dino.Stop / rig:Stop was called by a script
 local destroyed     = false
 local stopRun                 -- internal stop (forward)
 
-local startedEvent = Instance.new("BindableEvent")
-local stoppedEvent = Instance.new("BindableEvent")
+-- Lua signals. BindableEvent:Fire deep-copies tables: it errors on the
+-- rig ("tables cannot be cyclic", the rig points at its run and back)
+-- and would strip the rig's methods even if it didn't.
+local Signal = {}
+Signal.__index = Signal
+
+function Signal.new()
+    return setmetatable({ _handlers = {} }, Signal)
+end
+
+function Signal:Connect(fn)
+    assert(type(fn) == "function", "Connect needs a function")
+    local handlers = self._handlers
+    local conn = { Connected = true }
+    function conn.Disconnect()
+        if not conn.Connected then return end
+        conn.Connected = false
+        for i, h in ipairs(handlers) do
+            if h == conn then
+                table.remove(handlers, i)
+                break
+            end
+        end
+    end
+    conn._fn = fn
+    table.insert(handlers, conn)
+    return conn
+end
+
+function Signal:Once(fn)
+    local conn
+    conn = self:Connect(function(...)
+        conn.Disconnect()
+        fn(...)
+    end)
+    return conn
+end
+
+function Signal:Wait()
+    local thread = coroutine.running()
+    self:Once(function(...) task.spawn(thread, ...) end)
+    return coroutine.yield()
+end
+
+function Signal:Fire(...)
+    -- copy first: handlers may disconnect while firing
+    local list = table.clone(self._handlers)
+    for _, conn in ipairs(list) do
+        if conn.Connected then
+            local fn = conn._fn
+            task.spawn(function(...)
+                local ok, err = pcall(fn, ...)
+                if not ok then warn("[Dino] event handler error: " .. tostring(err)) end
+            end, ...)
+        end
+    end
+end
+
+function Signal:DisconnectAll()
+    for _, conn in ipairs(table.clone(self._handlers)) do conn.Disconnect() end
+end
+
+local startedEvent = Signal.new()
+local stoppedEvent = Signal.new()
 
 local function spawnCFrame()
     local sp = Workspace:FindFirstChildWhichIsA("SpawnLocation", true)
@@ -1388,13 +1509,13 @@ local function start()
     -- the respawn timer, THEN break (Krypton's order).
     local permaSignal = Config.PermanentDeath and Caps.replicatesignal ~= nil
     if permaSignal then
-        local ok = pcall(function() Caps.replicatesignal(Player.ConnectDiedSignalBackend) end)
+        local ok, perr = pcall(function() Caps.replicatesignal(Player.ConnectDiedSignalBackend) end)
         if ok then
             log("permadeath: waiting %.1fs for the respawn timer", Players.RespawnTime + 0.15)
             task.wait(Players.RespawnTime + 0.15)
             if not alive() then return fail("character changed while starting") end
         else
-            log("replicatesignal(ConnectDiedSignalBackend) failed, no signal permadeath")
+            log("replicatesignal(ConnectDiedSignalBackend) failed (%s), no signal permadeath", tostring(perr))
             permaSignal = false
         end
     end
@@ -1774,7 +1895,7 @@ local function start()
         RealParts    = realParts,
         RealHumanoid = realHum,
         Accessories  = run.hats,
-        Stopped      = stoppedEvent.Event,
+        Stopped      = stoppedEvent,
     }, RigMethods)
     run.rig = rig
     Dino.Current = rig
@@ -1844,8 +1965,8 @@ end
 Dino.Version       = "1.0"
 Dino.DefaultConfig = DEFAULTS
 Dino.Config        = Config
-Dino.Started       = startedEvent.Event    -- fires with the rig, also after auto restarts
-Dino.Stopped       = stoppedEvent.Event
+Dino.Started       = startedEvent    -- fires with the rig, also after auto restarts
+Dino.Stopped       = stoppedEvent
 Dino.AnimationSets = ANIM_SETS
 Dino.MovementStates = STATE_NAMES   -- valid states for rig:SetAnimation
 Dino.Current       = nil
@@ -1878,7 +1999,15 @@ function Dino.Start(config)
     starting = false
     if not ok then
         err, rig = tostring(rig), nil
-        State.running = false
+        -- a crash halfway must not leave a dead body with no driver:
+        -- full stop (restore + respawn), which also frees the reset button
+        if State.running then
+            local sok, serr = pcall(stopRun, {})
+            if not sok then
+                State.running = false
+                log("cleanup after the failed start errored: %s", tostring(serr))
+            end
+        end
     end
     if not rig then
         lastStartErr = err
@@ -1918,6 +2047,8 @@ function Dino.Destroy()
     destroyed, userStopped = true, true
     pcall(function() respawnConn:Disconnect() end)
     stopRun()
+    startedEvent:DisconnectAll()
+    stoppedEvent:DisconnectAll()
 end
 
 Global.DinoReanimate = Dino
