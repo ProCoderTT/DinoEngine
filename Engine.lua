@@ -1,3 +1,62 @@
+--[[
+    DINO REANIMATE  ·  reanimate engine
+    ─────────────────────────────────────────────────────────────────
+    A full-body limb reanimate ENGINE, in the spirit of Gelatek
+    Reanimate and Krypton: it does the hard part (fake rig, joints,
+    netless, ownership, permadeath, accessories, respawns) and hands your
+    script a rig to animate. No UI, no built-in moves: you build the
+    reanimate on top of it.
+
+    RUN (Gelatek style: reanimates as soon as it loads)
+        local Global = (getgenv and getgenv()) or shared
+        Global.DinoReanimateConfig = { RigMode = "Auto" }   -- any keys from DEFAULTS
+        loadstring(game:HttpGet("<raw url of this file>"))()
+
+    SCRIPTING ON TOP OF IT
+        local Dino = loadstring(game:HttpGet("<raw url>"))()
+        local rig = Dino.Start()      -- the running rig (waits if it's still starting)
+        -- set AutoStart = false in the config to start it yourself with Dino.Start({...})
+
+    ANIMATE (pick any mix)
+        rig:PlayAnimation(12345678, { Loop = true })   -- any Roblox animation id
+        rig:PlayAnimation("dance2")                    -- emotes from the default set
+        rig:SetAnimation("idle", 12345678)             -- animation pack override
+        rig:SetDefaultAnimations(false)                -- turn the movement anims off
+        rig:PlayKeyframes(myKeyframeTable)             -- keyframes written in your script
+        rig:PlayKeyframes("savedName")                 -- JSON from AnimationFolder
+        rig:OnStep(function(dt, rig)                   -- procedural: runs every frame
+            rig.JointsByPart["Right Arm"].Transform = CFrame.Angles(0, 0, math.rad(90))
+        end)
+
+    RESPAWNS
+        It reanimates again by itself after a respawn (AutoRestart). Hook
+        Dino.Started once and your script follows every new rig:
+            Dino.Started:Connect(function(rig) ... end)
+
+    WHAT IT DOES BETTER THAN GELATEK
+      Gelatek                               Dino
+      Constant (0,0,-25.8) velocity on       Velocity = the part's real motion
+        every part, every frame: others        (root velocity + animation), so
+        see drift and snap-back                other players see smooth motion
+      CFrames limbs after physics from last  Drives before physics from live
+        step's fake positions (frame late)     forward kinematics, re-pins after
+      BodyVelocity/BodyAngularVelocity       Per-part anti-gravity force only
+      Sets Player.Character to the fake rig  Keeps your character instance (Zeon
+        (servers can read it as a respawn)     split), so no respawn is triggered
+      Hard-coded R15->R6 offsets             Measured from your own body
+      Hats re-welded by name                 Hats follow their exact limb and
+                                               offset, by instance
+      Joints broken on your screen only      Server-side break + permadeath via
+                                               replicatesignal when available,
+                                               rebuilt joints cut again
+      Void -> dies or spawn                  Back to your last safe spot
+      Old Animate script copy                Animation controller + keyframes +
+                                               per-frame hook for your own anims
+      Loads remote code                      Loads nothing
+
+    Not included on purpose: Gelatek's fling modes (Bullet, TorsoFling).
+]]
+
 local Global = (getgenv and getgenv()) or shared
 
 -- One engine at a time: retire an older copy (and its auto restart)
@@ -36,7 +95,12 @@ local DEFAULTS = {
     AnimationFolder = "AutorigReanim",  -- JSON keyframe animations (FILES)
 
     -- Body / death
-    PermanentDeath = true,      -- use permadeath when available (replicatesignal or a -pd command)
+    PermanentDeath = true,      -- stay dead on the server so it never respawns you mid reanimate
+    PermadeathMethod = "Auto",  -- "Auto"     : replicatesignal, and if your executor can't, character reassign
+                                -- "Signal"   : replicatesignal(ConnectDiedSignalBackend) only (Krypton)
+                                -- "Reassign" : Player.Character = nil -> back (Zeon / Uhhhhhh), no executor function needed
+                                -- "Command"  : only the game's -pd chat command
+    ReassignSettle = 5,         -- seconds the server needs to take a reassign before the body may break
     KeepNeck       = "Auto",    -- "Auto" | true | false. Keeping it keeps you alive without permadeath (head can't move on its own)
     AutoRestart    = true,      -- reanimate again after a respawn
 
@@ -1388,6 +1452,31 @@ end
 -- START
 --==================================================
 
+-- Zeon / Uhhhhhh permadeath: hand the server the same character again.
+-- The server's "died -> respawn" hookup goes with the old assignment, so
+-- once it has settled (ReassignSettle) a dead body is NOT respawned.
+-- Doing it again on a dead body is how you ask for the respawn back.
+local function reassignCharacter()
+    local cam = Workspace.CurrentCamera
+    local camCF = cam and cam.CFrame
+    local ch = Player.Character
+    if not ch then return false end
+    local ok = pcall(function()
+        Player.Character = nil
+        Player.Character = ch
+    end)
+    if cam and camCF then
+        local con
+        con = cam.Changed:Connect(function(prop)
+            if prop ~= "Parent" and prop ~= "CFrame" then return end
+            cam.CFrame = camCF
+            con:Disconnect()
+        end)
+        task.delay(1, function() if con.Connected then con:Disconnect() end end)
+    end
+    return ok and Player.Character == ch
+end
+
 local function start()
     if State.running then return nil, "already running" end
     local char = Player.Character or Player.CharacterAdded:Wait()
@@ -1419,6 +1508,34 @@ local function start()
     end
 
     ----------------------------------------------------------------
+    -- 0. permadeath first: everything below counts toward its wait
+    ----------------------------------------------------------------
+    local method = Config.PermanentDeath and tostring(Config.PermadeathMethod or "Auto") or "Off"
+    local permaSignal, permaReassign = false, false
+    local permaAt = os.clock()
+    if method == "Auto" or method == "Signal" then
+        if Caps.replicatesignal then
+            local ok, perr = pcall(function() Caps.replicatesignal(Player.ConnectDiedSignalBackend) end)
+            if ok then
+                permaSignal = true
+            else
+                log("replicatesignal(ConnectDiedSignalBackend) failed (%s)", tostring(perr))
+            end
+        else
+            log("your executor has no replicatesignal")
+        end
+    end
+    if not permaSignal and (method == "Auto" or method == "Reassign") then
+        permaReassign = reassignCharacter()
+        if not permaReassign then log("character reassign failed") end
+    end
+    if Player.Character ~= char then return fail("character changed while starting") end
+    log("permadeath: %s", permaSignal and "replicatesignal"
+        or permaReassign and "character reassign"
+        or (method == "Command" and "-pd command only") or "none")
+    run.permaSignal, run.permaReassign = permaSignal, permaReassign
+
+    ----------------------------------------------------------------
     -- 1. chat: start line, avatar loaded, game commands
     ----------------------------------------------------------------
     if Config.StartMessage ~= "" then
@@ -1446,21 +1563,18 @@ local function start()
     task.wait(Config.SettleWait)
     if not alive() then return fail("character changed while starting") end
 
-    -- Permadeath through replicatesignal: tell the server first, wait out
-    -- the respawn timer, THEN break (Krypton's order).
-    local permaSignal = Config.PermanentDeath and Caps.replicatesignal ~= nil
-    if permaSignal then
-        local ok, perr = pcall(function() Caps.replicatesignal(Player.ConnectDiedSignalBackend) end)
-        if ok then
-            log("permadeath: waiting %.1fs for the respawn timer", Players.RespawnTime + 0.15)
-            task.wait(Players.RespawnTime + 0.15)
-            if not alive() then return fail("character changed while starting") end
-        else
-            log("replicatesignal(ConnectDiedSignalBackend) failed (%s), no signal permadeath", tostring(perr))
-            permaSignal = false
-        end
+    -- Never break before the server has taken the permadeath:
+    -- signal  -> the respawn timer (Krypton's order)
+    -- reassign -> ReassignSettle (break early and Health = 0 reads as a
+    --             real death: you get respawned, worst on busy servers)
+    local need = permaSignal and (Players.RespawnTime + 0.15)
+        or permaReassign and Config.ReassignSettle or 0
+    local left = need - (os.clock() - permaAt)
+    if left > 0 then
+        log("permadeath: waiting %.1fs more for the server", left)
+        task.wait(left)
+        if not alive() then return fail("character changed while starting") end
     end
-    run.permaSignal = permaSignal
 
     ----------------------------------------------------------------
     -- 2. body type + body parts
@@ -1531,7 +1645,7 @@ local function start()
     -- 5. death / neck
     ----------------------------------------------------------------
     local permaCmd = Config.PermanentDeath and table.find(Config.ChatCommands, "-pd") ~= nil
-    local perma = permaSignal or permaCmd
+    local perma = permaSignal or permaReassign or permaCmd
     local keepNeck = (Config.KeepNeck == true) or (Config.KeepNeck == "Auto" and not perma)
     run.keepNeck = keepNeck
 
@@ -1543,7 +1657,7 @@ local function start()
         end
         log("no permadeath: keeping your neck so you stay alive (head turns with the torso)")
     end
-    if not Caps.replicatesignal and not permaCmd then
+    if not permaSignal and not permaCmd then
         log("no replicatesignal and no -pd: the server keeps your joints, other players may see your body move as one piece")
     end
 
@@ -1577,6 +1691,32 @@ local function start()
     connect(char.DescendantAdded, antiRagdoll)
 
     for p in pairs(bodySet) do prepPart(p) end
+
+    -- The real body must never be "floor". A dead R15 humanoid turns its
+    -- limbs collidable again; the fake humanoid's floor check then hits
+    -- the real torso right under its own root, stands up on it, the real
+    -- body follows the fake up (with the netless lift on top) and you
+    -- climb forever. Keep collision, queries and touches off, always.
+    local function ghost(p)
+        if p.CanCollide then p.CanCollide = false end
+        if p.CanQuery then pcall(function() p.CanQuery = false end) end
+        if p.CanTouch then pcall(function() p.CanTouch = false end) end
+    end
+    run.ghost = ghost
+    local function watchGhost(p)
+        connect(p:GetPropertyChangedSignal("CanCollide"), function()
+            if run.running and p.CanCollide then p.CanCollide = false end
+        end)
+    end
+    for p in pairs(bodySet) do
+        ghost(p)
+        watchGhost(p)
+    end
+    for _, hd in ipairs(run.hats) do
+        ghost(hd.handle)
+        watchGhost(hd.handle)
+    end
+    run.watchGhost = watchGhost
 
     ----------------------------------------------------------------
     -- 7. split: real body into DinoBody, fake rig takes its place
@@ -1617,7 +1757,8 @@ local function start()
         end)
     end
     log("cut %d joints · permadeath: %s · neck: %s", cut,
-        perma and (permaSignal and "replicatesignal" or "-pd") or "off", keepNeck and "kept" or "free")
+        perma and (permaSignal and "replicatesignal" or permaReassign and "reassign" or "-pd") or "off",
+        keepNeck and "kept" or "free")
 
     Anim.reset(fakeHum, fakeRoot, run.rigType)
     physicsTweaks()
@@ -1634,6 +1775,8 @@ local function start()
         for _, p in ipairs(run.fakeParts) do
             if p.CanCollide then p.CanCollide = false end
         end
+        for p in pairs(bodySet) do ghost(p) end
+        for _, hd in ipairs(run.hats) do ghost(hd.handle) end
 
         -- keyframes, then the script's own hooks, override the Animator
         Files.step(dt, run.motors, run.rigType)
@@ -1688,7 +1831,10 @@ local function start()
 
     connect(RunService.PostSimulation, function()
         if not run.running then return end
-        for _, p in ipairs(run.driven) do reassert(p) end
+        for _, p in ipairs(run.driven) do
+            ghost(p)
+            reassert(p)
+        end
     end)
 
     local lastSafeAt = 0
@@ -1781,7 +1927,10 @@ local function start()
                 task.wait(0.1)
                 hd = addHat(run, v)
             until hd or os.clock() - t0 > 3 or not run.running
-            if hd then log("new accessory follows %s: %s", hd.limb.Name, v.Name) end
+            if hd then
+                run.watchGhost(hd.handle)
+                log("new accessory follows %s: %s", hd.limb.Name, v.Name)
+            end
         end)
     end)
 
@@ -1890,6 +2039,10 @@ stopRun = function(opts)
             end
             pcall(function() run.realHum.Health = 0 end)
             pcall(run.realHum.ChangeState, run.realHum, Enum.HumanoidStateType.Dead)
+            if run.permaReassign then
+                -- reassigning a dead body asks the server for the respawn
+                task.delay(0.1, reassignCharacter)
+            end
         end
     end
 
@@ -1971,6 +2124,8 @@ end
 -- Respawns: tidy up, then go again with the same config
 local respawnConn = Player.CharacterAdded:Connect(function(c)
     if destroyed then return end
+    -- the permadeath reassign hands back the SAME model: not a respawn
+    if c == State.char then return end
     if State.running and c ~= State.char then
         stopRun({ keepBody = true, respawned = true })
     end
